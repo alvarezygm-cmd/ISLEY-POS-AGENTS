@@ -85,13 +85,16 @@ async def generate_reply(text: str, has_media: bool = False) -> str:
     if handoff:
         return "Gracias por avisarme. Voy a pasar tu caso al administrador para que revise el pago y te confirme los próximos pasos. No compartas claves ni códigos de seguridad por este chat."
 
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return "Gracias por escribir a ISLEY POS. ¿Qué te gustaría saber del sistema o cuál es el tipo de negocio que tienes?"
 
-    client = AsyncOpenAI(api_key=api_key)
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
     response = await client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
         temperature=0.3,
         max_tokens=350,
         messages=[
