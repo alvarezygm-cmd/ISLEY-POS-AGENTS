@@ -29,6 +29,7 @@ class InboundMessage:
     text: str
     has_media: bool
     media_url: str | None
+    media_id: str | None
     display_name: str | None
     message_id: str | None
 
@@ -106,9 +107,55 @@ def _normalize_evolution(payload: dict[str, Any]) -> list[InboundMessage]:
         text=_walk_text(message),
         has_media=has_media,
         media_url=media_url,
+        media_id=None,
         display_name=data.get("pushName"),
         message_id=key.get("id"),
     )]
+
+
+def _normalize_whatsapp_cloud(payload: dict[str, Any]) -> list[InboundMessage]:
+    messages: list[InboundMessage] = []
+    entries = payload.get("entry", [])
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        changes = entry.get("changes", [])
+        for change in changes if isinstance(changes, list) else []:
+            if not isinstance(change, dict):
+                continue
+            value = change.get("value") or {}
+            if not isinstance(value, dict):
+                continue
+            contacts = value.get("contacts") or []
+            contact_by_number = {
+                str(contact.get("wa_id")): contact
+                for contact in contacts
+                if isinstance(contact, dict) and contact.get("wa_id")
+            }
+            inbound = value.get("messages") or []
+            for message in inbound if isinstance(inbound, list) else []:
+                if not isinstance(message, dict):
+                    continue
+                phone = str(message.get("from") or "")
+                if not phone:
+                    continue
+                message_type = str(message.get("type") or "")
+                media = message.get(message_type) if message_type in {"image", "audio", "video", "document", "sticker"} else None
+                contact = contact_by_number.get(phone, {})
+                profile = contact.get("profile") or {} if isinstance(contact, dict) else {}
+                text_content = message.get("text") or message.get("image") or message.get("video") or message.get("document") or {}
+                messages.append(InboundMessage(
+                    platform="whatsapp_cloud",
+                    social_id=phone,
+                    phone=phone,
+                    text=str(text_content.get("body") or text_content.get("caption") or "") if isinstance(text_content, dict) else "",
+                    has_media=bool(media),
+                    media_url=None,
+                    media_id=str(media.get("id")) if isinstance(media, dict) and media.get("id") else None,
+                    display_name=profile.get("name") if isinstance(profile, dict) else None,
+                    message_id=message.get("id"),
+                ))
+    return messages
 
 
 def _normalize_meta(payload: dict[str, Any]) -> list[InboundMessage]:
@@ -141,6 +188,7 @@ def _normalize_meta(payload: dict[str, Any]) -> list[InboundMessage]:
                 text=str(message.get("text") or ""),
                 has_media=bool(attachments),
                 media_url=(first_attachment.get("payload") or {}).get("url") if isinstance(first_attachment, dict) else None,
+                media_id=None,
                 display_name=None,
                 message_id=(message.get("mid") or event.get("postback", {}).get("mid")),
             ))
@@ -149,6 +197,8 @@ def _normalize_meta(payload: dict[str, Any]) -> list[InboundMessage]:
 
 def normalize_webhook(payload: dict[str, Any]) -> list[InboundMessage]:
     if "entry" in payload:
+        if payload.get("object") == "whatsapp_business_account":
+            return _normalize_whatsapp_cloud(payload)
         return _normalize_meta(payload)
     return _normalize_evolution(payload)
 
@@ -194,6 +244,7 @@ async def _notify_admin(message: InboundMessage, reason: str) -> None:
         "display_name": message.display_name,
         "message": message.text,
         "capture_url": message.media_url,
+        "capture_media_id": message.media_id,
         "message_id": message.message_id,
     }
     logger.warning("ADMIN_PAYMENT_HANDOFF %s", json.dumps(alert, ensure_ascii=False))
@@ -211,7 +262,25 @@ async def _notify_admin(message: InboundMessage, reason: str) -> None:
 async def _send_reply(message: InboundMessage, text: str) -> None:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            if message.platform == "whatsapp":
+            if message.platform == "whatsapp_cloud":
+                graph_version = os.getenv("META_GRAPH_VERSION", "v21.0")
+                phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+                access_token = os.getenv("WHATSAPP_ACCESS_TOKEN", os.getenv("META_PAGE_ACCESS_TOKEN", ""))
+                if not (phone_number_id and access_token and message.phone):
+                    logger.info("Respuesta generada, pero WhatsApp Cloud API no está configurado")
+                    return
+                response = await client.post(
+                    f"https://graph.facebook.com/{graph_version}/{phone_number_id}/messages",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={
+                        "messaging_product": "whatsapp",
+                        "recipient_type": "individual",
+                        "to": message.phone,
+                        "type": "text",
+                        "text": {"preview_url": False, "body": text},
+                    },
+                )
+            elif message.platform == "whatsapp":
                 base_url = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
                 instance = os.getenv("EVOLUTION_INSTANCE", "")
                 api_key = os.getenv("EVOLUTION_API_KEY", "")
